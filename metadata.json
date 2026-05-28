@@ -1,0 +1,6 @@
+{
+  "name": "KriptoKini",
+  "description": "Portal berita crypto modern dengan pelacakan harga koin real-time, analisis teknikal harian, newsletter, pencarian canggih, dan ruang komentar interaktif.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
