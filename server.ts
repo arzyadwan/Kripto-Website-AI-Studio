@@ -2,6 +2,7 @@ import express from "express";
 import path from "path";
 import fs from "fs";
 import { createServer as createViteServer } from "vite";
+import { createClient } from "@supabase/supabase-js";
 
 interface Comment {
   id: string;
@@ -44,7 +45,7 @@ Dalam kurun waktu beberapa bulan ke depan, kita akan menyaksikan pengenalan kera
 
 ### Gelombang Transparansi Baru
 
-Para analis berargumen bahwa pengetatan audit kepatuhan ini di satu sisi melukai prinsip otonom mutlak awal blockchain, tetapi di sisi lain merupakan jalur tol (highway) tak terhindarkan bagi modal institusional raksasa senilai triliunan dolar untuk masuk secara legal melalui dana abadi dan ETF Spot.
+Para analis berargumen bahwa pengetatan audit kepatuhan ini di satu sisi melukai prinsip otonom mutlak awal blockchain, tetapi di sisi lain merupakan jalur tom (highway) tak terhindarkan bagi modal institusional raksasa senilai triliunan dolar untuk masuk secara legal melalui dana abadi dan ETF Spot.
 
 ### Pola Konsolidasi Klasik
 
@@ -315,27 +316,60 @@ interface DBStructure {
   comments: Comment[];
 }
 
-// Read database or initialize with mock data
-function readDB(): DBStructure {
+// Supabase client instance builder with local fallback safety
+const SU_URL = process.env.SUPABASE_URL || "";
+const SU_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY || "";
+const isSupaEnabled = SU_URL.trim().length > 0 && SU_KEY.trim().length > 0;
+const supabase = isSupaEnabled ? createClient(SU_URL, SU_KEY) : null;
+
+if (isSupaEnabled) {
+  console.log("🟢 SUPABASE DETECTED: Running in cloud DB mode synced to Supabase PostgreSQL.");
+} else {
+  console.log("🟡 NO SUPABASE KEYS: Running in local DB mode using local standard db.json.");
+}
+
+// Read local JSON file database fallback
+function readLocalDB(): DBStructure {
   try {
     if (fs.existsSync(DB_PATH)) {
       const data = fs.readFileSync(DB_PATH, "utf8");
       return JSON.parse(data);
     }
   } catch (err) {
-    console.error("Error reading db file. Reinitializing...", err);
+    console.error("Error reading local db file.", err);
   }
   
   const initial = { articles: DEFAULT_INITIAL_ARTICLES, comments: DEFAULT_INITIAL_COMMENTS };
-  writeDB(initial);
+  writeLocalDB(initial);
   return initial;
 }
 
-function writeDB(data: DBStructure) {
+function writeLocalDB(data: DBStructure) {
   try {
     fs.writeFileSync(DB_PATH, JSON.stringify(data, null, 2), "utf8");
   } catch (err) {
-    console.error("Error writing db file:", err);
+    console.error("Error writing db.json file:", err);
+  }
+}
+
+// Auto-seed Supabase tables if they are empty on Cold Startup
+async function seedSupabaseIfNeeded() {
+  if (!isSupaEnabled || !supabase) return;
+  try {
+    const { data: artCheck, error: artErr } = await supabase.from("articles").select("id").limit(1);
+    if (!artErr && (!artCheck || artCheck.length === 0)) {
+      console.log("⏳ Supabase empty. Seeding DEFAULT_INITIAL_ARTICLES table...");
+      // For each article, make sure tags is ready
+      await supabase.from("articles").insert(DEFAULT_INITIAL_ARTICLES);
+    }
+
+    const { data: commCheck, error: commErr } = await supabase.from("comments").select("id").limit(1);
+    if (!commErr && (!commCheck || commCheck.length === 0)) {
+      console.log("⏳ Seeding DEFAULT_INITIAL_COMMENTS table into Supabase...");
+      await supabase.from("comments").insert(DEFAULT_INITIAL_COMMENTS);
+    }
+  } catch (err) {
+    console.warn("⚠️ Automatic Supabase seeding warning:", err);
   }
 }
 
@@ -345,37 +379,66 @@ async function startServer() {
 
   app.use(express.json());
 
+  // Run the automatic seeding checker
+  await seedSupabaseIfNeeded();
+
   // GET all articles
-  app.get("/api/articles", (req, res) => {
+  app.get("/api/articles", async (req, res) => {
     try {
-      const db = readDB();
-      res.json(db.articles);
-    } catch (err) {
+      if (isSupaEnabled && supabase) {
+        const { data, error } = await supabase
+          .from("articles")
+          .select("*")
+          .order("id", { ascending: false });
+        
+        if (error) throw error;
+        return res.json(data || []);
+      } else {
+        const db = readLocalDB();
+        res.json(db.articles);
+      }
+    } catch (err: any) {
+      console.error("GET /api/articles database error:", err);
       res.status(500).json({ error: "Failed to read articles" });
     }
   });
 
   // GET article by id
-  app.get("/api/articles/:id", (req, res) => {
+  app.get("/api/articles/:id", async (req, res) => {
     try {
-      const db = readDB();
-      const art = db.articles.find(a => a.id === req.params.id);
-      if (art) {
-        res.json(art);
+      const { id } = req.params;
+      if (isSupaEnabled && supabase) {
+        const { data, error } = await supabase
+          .from("articles")
+          .select("*")
+          .eq("id", id)
+          .maybeSingle();
+
+        if (error) throw error;
+        if (data) {
+          return res.json(data);
+        } else {
+          return res.status(404).json({ error: "Article not found on Supabase" });
+        }
       } else {
-        res.status(404).json({ error: "Article not found" });
+        const db = readLocalDB();
+        const art = db.articles.find(a => a.id === id);
+        if (art) {
+          res.json(art);
+        } else {
+          res.status(404).json({ error: "Article not found on local db" });
+        }
       }
-    } catch (err) {
+    } catch (err: any) {
+      console.error("GET article by id database error:", err);
       res.status(500).json({ error: "Error retrieving article" });
     }
   });
 
   // POST create new article
-  app.post("/api/articles", (req, res) => {
+  app.post("/api/articles", async (req, res) => {
     try {
-      const db = readDB();
       const body = req.body;
-
       if (!body.title || !body.summary || !body.content || !body.category) {
         return res.status(400).json({ error: "Required fields are missing" });
       }
@@ -397,135 +460,240 @@ async function startServer() {
         views: Number(body.views) || 0
       };
 
-      db.articles.unshift(newArticle);
-      writeDB(db);
+      if (isSupaEnabled && supabase) {
+        const { data, error } = await supabase
+          .from("articles")
+          .insert([newArticle])
+          .select()
+          .single();
 
-      res.status(201).json(newArticle);
-    } catch (err) {
-      res.status(500).json({ error: "Failed to create article" });
+        if (error) throw error;
+        res.status(201).json(data);
+      } else {
+        const db = readLocalDB();
+        db.articles.unshift(newArticle);
+        writeLocalDB(db);
+        res.status(201).json(newArticle);
+      }
+    } catch (err: any) {
+      console.error("POST /api/articles database error:", err);
+      res.status(500).json({ error: "Failed to create article on backend" });
     }
   });
 
   // PUT update article
-  app.put("/api/articles/:id", (req, res) => {
+  app.put("/api/articles/:id", async (req, res) => {
     try {
-      const db = readDB();
       const { id } = req.params;
-      const index = db.articles.findIndex(a => a.id === id);
-
-      if (index === -1) {
-        return res.status(404).json({ error: "Article not found" });
-      }
-
       const body = req.body;
-      const existing = db.articles[index];
 
-      const updatedArticle: Article = {
-        ...existing,
-        title: body.title !== undefined ? body.title : existing.title,
-        summary: body.summary !== undefined ? body.summary : existing.summary,
-        content: body.content !== undefined ? body.content : existing.content,
-        image: body.image !== undefined ? body.image : existing.image,
-        author: body.author !== undefined ? body.author : existing.author,
-        readTime: body.readTime !== undefined ? body.readTime : existing.readTime,
-        category: body.category !== undefined ? body.category : existing.category,
-        tags: Array.isArray(body.tags) ? body.tags : existing.tags,
-        likes: body.likes !== undefined ? Number(body.likes) : existing.likes,
-        views: body.views !== undefined ? Number(body.views) : existing.views
-      };
+      if (isSupaEnabled && supabase) {
+        // Retrieve existing record first to merge keys safely
+        const { data: existing, error: getErr } = await supabase
+          .from("articles")
+          .select("*")
+          .eq("id", id)
+          .maybeSingle();
 
-      db.articles[index] = updatedArticle;
-      writeDB(db);
+        if (getErr) throw getErr;
+        if (!existing) return res.status(404).json({ error: "Article not found on Supabase" });
 
-      res.json(updatedArticle);
-    } catch (err) {
-      res.status(500).json({ error: "Failed to update article" });
+        const updatedFields = {
+          title: body.title !== undefined ? body.title : existing.title,
+          summary: body.summary !== undefined ? body.summary : existing.summary,
+          content: body.content !== undefined ? body.content : existing.content,
+          image: body.image !== undefined ? body.image : existing.image,
+          author: body.author !== undefined ? body.author : existing.author,
+          readTime: body.readTime !== undefined ? body.readTime : existing.readTime,
+          category: body.category !== undefined ? body.category : existing.category,
+          tags: Array.isArray(body.tags) ? body.tags : existing.tags,
+          likes: body.likes !== undefined ? Number(body.likes) : existing.likes,
+          views: body.views !== undefined ? Number(body.views) : existing.views
+        };
+
+        const { data, error } = await supabase
+          .from("articles")
+          .update(updatedFields)
+          .eq("id", id)
+          .select()
+          .single();
+
+        if (error) throw error;
+        res.json(data);
+      } else {
+        const db = readLocalDB();
+        const index = db.articles.findIndex(a => a.id === id);
+
+        if (index === -1) {
+          return res.status(404).json({ error: "Article not found" });
+        }
+
+        const existing = db.articles[index];
+        const updatedArticle: Article = {
+          ...existing,
+          title: body.title !== undefined ? body.title : existing.title,
+          summary: body.summary !== undefined ? body.summary : existing.summary,
+          content: body.content !== undefined ? body.content : existing.content,
+          image: body.image !== undefined ? body.image : existing.image,
+          author: body.author !== undefined ? body.author : existing.author,
+          readTime: body.readTime !== undefined ? body.readTime : existing.readTime,
+          category: body.category !== undefined ? body.category : existing.category,
+          tags: Array.isArray(body.tags) ? body.tags : existing.tags,
+          likes: body.likes !== undefined ? Number(body.likes) : existing.likes,
+          views: body.views !== undefined ? Number(body.views) : existing.views
+        };
+
+        db.articles[index] = updatedArticle;
+        writeLocalDB(db);
+        res.json(updatedArticle);
+      }
+    } catch (err: any) {
+      console.error("PUT /api/articles database error:", err);
+      res.status(500).json({ error: "Failed to update article on backend" });
     }
   });
 
   // DELETE delete article
-  app.delete("/api/articles/:id", (req, res) => {
+  app.delete("/api/articles/:id", async (req, res) => {
     try {
-      const db = readDB();
       const { id } = req.params;
-      const filtered = db.articles.filter(a => a.id !== id);
-      
-      if (filtered.length === db.articles.length) {
-        return res.status(404).json({ error: "Article not found" });
+      if (isSupaEnabled && supabase) {
+        // Cascade delete on comments table is registered or we do it programmatically
+        await supabase.from("comments").delete().eq("articleId", id);
+        const { error } = await supabase.from("articles").delete().eq("id", id);
+        if (error) throw error;
+
+        res.json({ message: "Article and its comments deleted successfully from Supabase" });
+      } else {
+        const db = readLocalDB();
+        const filtered = db.articles.filter(a => a.id !== id);
+        
+        if (filtered.length === db.articles.length) {
+          return res.status(404).json({ error: "Article not found on local fallback" });
+        }
+
+        db.articles = filtered;
+        db.comments = db.comments.filter(c => c.articleId !== id);
+        writeLocalDB(db);
+
+        res.json({ message: "Article and its comments deleted successfully from local db" });
       }
-
-      db.articles = filtered;
-      // also delete associated comments
-      db.comments = db.comments.filter(c => c.articleId !== id);
-      writeDB(db);
-
-      res.json({ message: "Article and its comments deleted successfully" });
-    } catch (err) {
+    } catch (err: any) {
+      console.error("DELETE /api/articles database error:", err);
       res.status(500).json({ error: "Failed to delete article" });
     }
   });
 
   // INCREMENT likes on article
-  app.post("/api/articles/:id/like", (req, res) => {
+  app.post("/api/articles/:id/like", async (req, res) => {
     try {
-      const db = readDB();
       const { id } = req.params;
-      const index = db.articles.findIndex(a => a.id === id);
+      if (isSupaEnabled && supabase) {
+        // Get current, then increment
+        const { data: art, error: getErr } = await supabase
+          .from("articles")
+          .select("likes")
+          .eq("id", id)
+          .maybeSingle();
 
-      if (index === -1) {
-        return res.status(404).json({ error: "Article not found" });
+        if (getErr) throw getErr;
+        const currentLikes = art?.likes || 0;
+
+        const { data, error } = await supabase
+          .from("articles")
+          .update({ likes: currentLikes + 1 })
+          .eq("id", id)
+          .select()
+          .single();
+
+        if (error) throw error;
+        res.json(data);
+      } else {
+        const db = readLocalDB();
+        const index = db.articles.findIndex(a => a.id === id);
+
+        if (index === -1) {
+          return res.status(404).json({ error: "Article not found" });
+        }
+
+        db.articles[index].likes += 1;
+        writeLocalDB(db);
+        res.json(db.articles[index]);
       }
-
-      db.articles[index].likes += 1;
-      writeDB(db);
-      res.json(db.articles[index]);
-    } catch (err) {
+    } catch (err: any) {
+      console.error("POST like database error:", err);
       res.status(500).json({ error: "Failed to like article" });
     }
   });
 
   // INCREMENT views on article
-  app.post("/api/articles/:id/view", (req, res) => {
+  app.post("/api/articles/:id/view", async (req, res) => {
     try {
-      const db = readDB();
       const { id } = req.params;
-      const index = db.articles.findIndex(a => a.id === id);
+      if (isSupaEnabled && supabase) {
+        const { data: art, error: getErr } = await supabase
+          .from("articles")
+          .select("views")
+          .eq("id", id)
+          .maybeSingle();
 
-      if (index === -1) {
-        return res.status(404).json({ error: "Article not found" });
+        if (getErr) throw getErr;
+        const currentViews = art?.views || 0;
+
+        const { data, error } = await supabase
+          .from("articles")
+          .update({ views: currentViews + 1 })
+          .eq("id", id)
+          .select()
+          .single();
+
+        if (error) throw error;
+        res.json(data);
+      } else {
+        const db = readLocalDB();
+        const index = db.articles.findIndex(a => a.id === id);
+
+        if (index === -1) {
+          return res.status(404).json({ error: "Article not found" });
+        }
+
+        db.articles[index].views += 1;
+        writeLocalDB(db);
+        res.json(db.articles[index]);
       }
-
-      db.articles[index].views += 1;
-      writeDB(db);
-      res.json(db.articles[index]);
-    } catch (err) {
+    } catch (err: any) {
+      console.error("POST view database error:", err);
       res.status(500).json({ error: "Failed to track view" });
     }
   });
 
   // GET all comments
-  app.get("/api/comments", (req, res) => {
+  app.get("/api/comments", async (req, res) => {
     try {
-      const db = readDB();
-      res.json(db.comments);
-    } catch (err) {
+      if (isSupaEnabled && supabase) {
+        const { data, error } = await supabase
+          .from("comments")
+          .select("*")
+          .order("id", { ascending: true });
+
+        if (error) throw error;
+        res.json(data || []);
+      } else {
+        const db = readLocalDB();
+        res.json(db.comments);
+      }
+    } catch (err: any) {
+      console.error("GET comments database error:", err);
       res.status(500).json({ error: "Failed to read comments" });
     }
   });
 
   // POST create new comment
-  app.post("/api/comments", (req, res) => {
+  app.post("/api/comments", async (req, res) => {
     try {
-      const db = readDB();
       const body = req.body;
-
       if (!body.articleId || !body.author || !body.content) {
         return res.status(400).json({ error: "Required comment fields are missing" });
-      }
-
-      const articleIndex = db.articles.findIndex(a => a.id === body.articleId);
-      if (articleIndex === -1) {
-        return res.status(404).json({ error: "Article not found" });
       }
 
       const newComment: Comment = {
@@ -538,31 +706,88 @@ async function startServer() {
         avatar: body.avatar || `https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?q=80&w=100&auto=format&fit=crop`
       };
 
-      db.comments.push(newComment);
-      db.articles[articleIndex].commentsCount += 1;
-      writeDB(db);
+      if (isSupaEnabled && supabase) {
+        // Find existing article commentsCount, increment it
+        const { data: art, error: artErr } = await supabase
+          .from("articles")
+          .select("commentsCount")
+          .eq("id", body.articleId)
+          .maybeSingle();
 
-      res.status(201).json(newComment);
-    } catch (err) {
-      res.status(500).json({ error: "Failed to add comment" });
+        if (artErr) throw artErr;
+        if (!art) return res.status(404).json({ error: "Article not found on Supabase" });
+
+        const { data: commentData, error: insertCommentErr } = await supabase
+          .from("comments")
+          .insert([newComment])
+          .select()
+          .single();
+
+        if (insertCommentErr) throw insertCommentErr;
+
+        // update commentsCount inside articles
+        await supabase
+          .from("articles")
+          .update({ commentsCount: (art.commentsCount || 0) + 1 })
+          .eq("id", body.articleId);
+
+        res.status(201).json(commentData);
+      } else {
+        const db = readLocalDB();
+        const articleIndex = db.articles.findIndex(a => a.id === body.articleId);
+        if (articleIndex === -1) {
+          return res.status(404).json({ error: "Article not found on local db" });
+        }
+
+        db.comments.push(newComment);
+        db.articles[articleIndex].commentsCount += 1;
+        writeLocalDB(db);
+
+        res.status(201).json(newComment);
+      }
+    } catch (err: any) {
+      console.error("POST comment database error:", err);
+      res.status(500).json({ error: "Failed to add comment to database" });
     }
   });
 
   // POST like comment
-  app.post("/api/comments/:id/like", (req, res) => {
+  app.post("/api/comments/:id/like", async (req, res) => {
     try {
-      const db = readDB();
       const { id } = req.params;
-      const index = db.comments.findIndex(c => c.id === id);
+      if (isSupaEnabled && supabase) {
+        const { data: comm, error: getErr } = await supabase
+          .from("comments")
+          .select("likes")
+          .eq("id", id)
+          .maybeSingle();
 
-      if (index === -1) {
-        return res.status(404).json({ error: "Comment not found" });
+        if (getErr) throw getErr;
+        if (!comm) return res.status(404).json({ error: "Comment not found on Supabase" });
+
+        const { data, error } = await supabase
+          .from("comments")
+          .update({ likes: (comm.likes || 0) + 1 })
+          .eq("id", id)
+          .select()
+          .single();
+
+        if (error) throw error;
+        res.json(data);
+      } else {
+        const db = readLocalDB();
+        const index = db.comments.findIndex(c => c.id === id);
+
+        if (index === -1) {
+          return res.status(404).json({ error: "Comment not found" });
+        }
+
+        db.comments[index].likes += 1;
+        writeLocalDB(db);
+        res.json(db.comments[index]);
       }
-
-      db.comments[index].likes += 1;
-      writeDB(db);
-      res.json(db.comments[index]);
-    } catch (err) {
+    } catch (err: any) {
+      console.error("POST comment like database error:", err);
       res.status(500).json({ error: "Failed to like comment" });
     }
   });
@@ -588,3 +813,4 @@ async function startServer() {
 }
 
 startServer();
+
