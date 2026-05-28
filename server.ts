@@ -379,8 +379,8 @@ async function startServer() {
 
   app.use(express.json());
 
-  // Run the automatic seeding checker
-  await seedSupabaseIfNeeded();
+  // Run the automatic seeding checker in the background to avoid blocking server boot
+  seedSupabaseIfNeeded().catch(err => console.warn("Supabase seeding background warning:", err));
 
   // GET all articles
   app.get("/api/articles", async (req, res) => {
